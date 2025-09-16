@@ -5,9 +5,24 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 )
+
+// formatFileSize 格式化文件大小
+func formatFileSize(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := int64(unit), 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
+}
 
 func main() {
 	// 设置panic恢复
@@ -40,13 +55,28 @@ func main() {
 
 	// 创建文件处理器
 	processor := NewFileProcessor(config, db)
+	
+	// 批量预创建目录结构
+	LogInfo("🚀 开始批量预创建目录结构...")
+	if err := processor.PreCreateDirectories(); err != nil {
+		LogError("批量预创建目录失败: %v", err)
+	}
 
-	// 确保目标文件夹存在
+	// 创建目标文件夹（如果不存在）
 	if err := os.MkdirAll(config.TargetFolder, 0755); err != nil {
-		LogFatal("创建目标文件夹失败: %v", err)
+		LogError("创建目标文件夹失败: %v", err)
+		return
 	}
 
 	// 打印启动信息
+	LogInfo("🚀 文件移动系统启动")
+	LogInfo("📂 源文件夹: %s", config.SourceFolder)
+	LogInfo("📁 目标文件夹: %s", config.TargetFolder)
+	LogInfo("⚡ 智能工作线程数: %d (CPU核心数: %d)", config.ConcurrentWorkers, runtime.NumCPU())
+	LogInfo("🔍 哈希算法: %s", config.HashAlgorithm)
+	LogInfo("📊 支持的文件类型: %v", config.SupportedTypes)
+	LogInfo("💾 最大文件大小: %s", formatFileSize(int64(config.MaxFileSize)))
+
 	fmt.Println("========================================")
 	fmt.Println("       文件整理系统 v1.0")
 	fmt.Println("========================================")

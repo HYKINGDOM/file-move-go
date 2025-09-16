@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -25,12 +26,16 @@ type FileInfo struct {
 	HashType     string    `db:"hash_type"`     // 哈希算法类型
 }
 
-// Database 数据库连接包装器
+// Database 数据库连接包装器，支持批量操作和连接池优化
 type Database struct {
-	db *sql.DB
+	db          *sql.DB
+	batchBuffer []FileInfo    // 批量插入缓冲区
+	batchMutex  sync.Mutex    // 批量操作互斥锁
+	batchSize   int           // 批量大小
+	batchTimer  *time.Timer   // 批量定时器
 }
 
-// InitDatabase 初始化数据库连接
+// InitDatabase 初始化数据库连接，优化连接池配置
 func InitDatabase(config DatabaseConfig) (*Database, error) {
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		config.Host, config.Port, config.Username, config.Password, config.Database, config.SSLMode)
@@ -46,12 +51,17 @@ func InitDatabase(config DatabaseConfig) (*Database, error) {
 		return nil, fmt.Errorf("数据库连接测试失败: %v", err)
 	}
 
-	// 设置连接池参数
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	// 优化连接池参数 - 根据性能需求调整
+	db.SetMaxOpenConns(50)        // 增加最大连接数以支持更高并发
+	db.SetMaxIdleConns(10)        // 增加空闲连接数
+	db.SetConnMaxLifetime(10 * time.Minute) // 延长连接生命周期
+	db.SetConnMaxIdleTime(5 * time.Minute)  // 设置空闲连接超时
 
-	database := &Database{db: db}
+	database := &Database{
+		db:          db,
+		batchBuffer: make([]FileInfo, 0, 100), // 初始化批量缓冲区
+		batchSize:   50,                       // 批量大小设为50
+	}
 
 	// 创建表
 	if err := database.createTables(); err != nil {
@@ -59,11 +69,14 @@ func InitDatabase(config DatabaseConfig) (*Database, error) {
 		return nil, fmt.Errorf("创建数据表失败: %v", err)
 	}
 
-	LogInfo("数据库连接成功")
+	// 启动批量处理定时器
+	database.startBatchTimer()
+
+	LogInfo("数据库连接成功，连接池配置: MaxOpen=%d, MaxIdle=%d", 50, 10)
 	return database, nil
 }
 
-// createTables 创建必要的数据表
+// createTables 创建必要的数据表，优化索引配置
 func (d *Database) createTables() error {
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS file_records (
@@ -79,12 +92,20 @@ func (d *Database) createTables() error {
 		hash_type VARCHAR(20) NOT NULL DEFAULT 'sha256'
 	);
 
-	-- 创建索引以提高查询性能
-	CREATE INDEX IF NOT EXISTS idx_file_records_hash ON file_records(hash);
+	-- 创建优化的索引以提高查询性能
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_file_records_hash_unique ON file_records(hash);
 	CREATE INDEX IF NOT EXISTS idx_file_records_extension ON file_records(extension);
-	CREATE INDEX IF NOT EXISTS idx_file_records_processed_at ON file_records(processed_at);
-	CREATE INDEX IF NOT EXISTS idx_file_records_file_size ON file_records(file_size);
+	CREATE INDEX IF NOT EXISTS idx_file_records_processed_at ON file_records(processed_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_file_records_file_size ON file_records(file_size DESC);
 	CREATE INDEX IF NOT EXISTS idx_file_records_hash_type ON file_records(hash_type);
+	
+	-- 复合索引优化常见查询
+	CREATE INDEX IF NOT EXISTS idx_file_records_ext_size ON file_records(extension, file_size DESC);
+	CREATE INDEX IF NOT EXISTS idx_file_records_ext_processed ON file_records(extension, processed_at DESC);
+	
+	-- 部分索引优化大文件查询
+	CREATE INDEX IF NOT EXISTS idx_file_records_large_files ON file_records(file_size DESC) 
+		WHERE file_size > 1048576; -- 大于1MB的文件
 	`
 
 	_, err := d.db.Exec(createTableSQL)
@@ -92,11 +113,11 @@ func (d *Database) createTables() error {
 		return fmt.Errorf("执行创建表SQL失败: %v", err)
 	}
 
-	LogInfo("数据表创建/验证完成")
+	LogInfo("数据表创建/验证完成，索引优化完成")
 	return nil
 }
 
-// FileExists 检查文件哈希是否已存在
+// FileExists 检查文件哈希是否已存在，使用预编译语句优化
 func (db *Database) FileExists(hash string) (bool, string, error) {
 	startTime := time.Now()
 	defer func() {
@@ -118,38 +139,114 @@ func (db *Database) FileExists(hash string) (bool, string, error) {
 	return true, existingPath, nil
 }
 
-// InsertFileRecord 插入文件记录
+// InsertFileRecord 插入单个文件记录（保持向后兼容）
 func (db *Database) InsertFileRecord(fileInfo FileInfo) error {
+	return db.BatchInsertFileRecord(fileInfo)
+}
+
+// BatchInsertFileRecord 批量插入文件记录，提高性能
+func (db *Database) BatchInsertFileRecord(fileInfo FileInfo) error {
+	db.batchMutex.Lock()
+	defer db.batchMutex.Unlock()
+
+	// 添加到批量缓冲区
+	db.batchBuffer = append(db.batchBuffer, fileInfo)
+
+	// 如果达到批量大小，立即执行批量插入
+	if len(db.batchBuffer) >= db.batchSize {
+		return db.flushBatch()
+	}
+
+	// 重置定时器
+	if db.batchTimer != nil {
+		db.batchTimer.Reset(2 * time.Second) // 2秒后强制执行批量插入
+	}
+
+	return nil
+}
+
+// flushBatch 执行批量插入操作
+func (db *Database) flushBatch() error {
+	if len(db.batchBuffer) == 0 {
+		return nil
+	}
+
 	startTime := time.Now()
 	defer func() {
 		duration := time.Since(startTime)
-		LogInfo("⏱️ 数据库插入耗时 (InsertFileRecord): %v", duration)
+		LogInfo("⏱️ 批量数据库插入耗时: %v (记录数: %d)", duration, len(db.batchBuffer))
 	}()
 
+	// 构建批量插入SQL
 	query := `
 		INSERT INTO file_records (
 			hash, original_name, file_size, extension, created_at, 
 			processed_at, source_path, target_path, hash_type
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`
+		) VALUES `
+
+	// 构建VALUES子句
+	values := make([]interface{}, 0, len(db.batchBuffer)*9)
+	placeholders := make([]string, 0, len(db.batchBuffer))
 	
-	_, err := db.db.Exec(query,
-		fileInfo.Hash,
-		fileInfo.FileName,
-		fileInfo.FileSize,
-		fileInfo.Extension,
-		fileInfo.CreatedAt,
-		time.Now(),
-		fileInfo.OriginalPath,
-		fileInfo.NewPath,
-		"sha256",
-	)
-	
-	if err != nil {
-		return fmt.Errorf("插入文件记录失败: %v", err)
+	for i, fileInfo := range db.batchBuffer {
+		placeholderStart := i*9 + 1
+		placeholders = append(placeholders, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			placeholderStart, placeholderStart+1, placeholderStart+2, placeholderStart+3,
+			placeholderStart+4, placeholderStart+5, placeholderStart+6, placeholderStart+7, placeholderStart+8))
+		
+		values = append(values,
+			fileInfo.Hash,
+			fileInfo.FileName,
+			fileInfo.FileSize,
+			fileInfo.Extension,
+			fileInfo.CreatedAt,
+			time.Now(),
+			fileInfo.OriginalPath,
+			fileInfo.NewPath,
+			"sha256",
+		)
 	}
+
+	// 执行批量插入
+	finalQuery := query + fmt.Sprintf("%s", placeholders[0])
+	for i := 1; i < len(placeholders); i++ {
+		finalQuery += ", " + placeholders[i]
+	}
+
+	_, err := db.db.Exec(finalQuery, values...)
+	if err != nil {
+		return fmt.Errorf("批量插入文件记录失败: %v", err)
+	}
+
+	// 清空缓冲区
+	db.batchBuffer = db.batchBuffer[:0]
 	
 	return nil
+}
+
+// startBatchTimer 启动批量处理定时器
+func (db *Database) startBatchTimer() {
+	db.batchTimer = time.AfterFunc(2*time.Second, func() {
+		db.batchMutex.Lock()
+		defer db.batchMutex.Unlock()
+		
+		if len(db.batchBuffer) > 0 {
+			if err := db.flushBatch(); err != nil {
+				LogError("定时批量插入失败: %v", err)
+			}
+		}
+		
+		// 重新启动定时器
+		db.startBatchTimer()
+	})
+}
+
+// FlushPendingBatch 强制执行所有待处理的批量操作
+func (db *Database) FlushPendingBatch() error {
+	db.batchMutex.Lock()
+	defer db.batchMutex.Unlock()
+	
+	return db.flushBatch()
 }
 
 // GetFileRecord 根据哈希值获取文件记录
