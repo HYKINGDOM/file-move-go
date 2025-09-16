@@ -1,0 +1,59 @@
+# 文件处理系统配置文件
+# 请根据实际环境修改以下配置
+
+# 数据库配置
+database:
+  host: "10.0.203.172"          # 数据库主机地址
+  port: 5432                    # 数据库端口
+  username: "user_tZGjBb"       # 数据库用户名
+  password: "password_fajJed"   # 数据库密码
+  database: "user_tZGjBb"       # 数据库名
+  ssl_mode: "disable"           # SSL模式: disable, require, verify-ca, verify-full
+
+# 文件夹配置
+source_folder: "D:\\download"      # 源文件夹路径（监控的文件夹）
+target_folder: "D:\\converted_images"      # 目标文件夹路径（处理后文件存放位置）
+
+# 支持的文件类型（图片文件）
+supported_types:
+  - ".jpg"
+  - ".jpeg"
+  - ".png"
+  - ".gif"
+  - ".bmp"
+  - ".tiff"
+  - ".tif"
+  - ".webp"
+  - ".svg"
+  - ".ico"
+  - ".raw"
+  - ".cr2"
+  - ".nef"
+  - ".arw"
+
+# 哈希算法配置
+hash_algorithm: "sha256"        # 支持: md5, sha256
+
+# 日志配置
+log_level: "info"               # 日志级别: debug, info, warn, error
+
+# 性能配置
+max_file_size: 104857600        # 最大文件大小限制（字节），默认100MB
+concurrent_workers: 4           # 并发处理文件数量
+
+# 高级配置（可选）
+# 以下配置项在代码中有默认值，可以根据需要调整
+
+# 监控配置
+# debounce_duration: 2          # 防抖延迟时间（秒）
+# retry_attempts: 3             # 文件处理重试次数
+# retry_delay: 1                # 重试间隔（秒）
+
+# 文件组织配置
+# organize_by_date: true        # 是否按日期组织目标文件夹
+# date_format: "2006/01/02"     # 日期格式
+
+# 数据库连接池配置
+# max_open_conns: 25            # 最大打开连接数
+# max_idle_conns: 5             # 最大空闲连接数
+# conn_max_lifetime: 300        # 连接最大生存时间（秒）
