@@ -3,7 +3,6 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"log"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -14,6 +13,9 @@ type FileInfo struct {
 	ID           int64     `db:"id"`            // 自增主键
 	Hash         string    `db:"hash"`          // 文件哈希值(唯一索引)
 	OriginalName string    `db:"original_name"` // 原始文件名
+	OriginalPath string    `db:"original_path"` // 原始文件路径
+	NewPath      string    `db:"new_path"`      // 新文件路径
+	FileName     string    `db:"file_name"`     // 文件名
 	FileSize     int64     `db:"file_size"`     // 文件大小(字节)
 	Extension    string    `db:"extension"`     // 文件扩展名
 	CreatedAt    time.Time `db:"created_at"`    // 文件创建时间
@@ -57,7 +59,7 @@ func InitDatabase(config DatabaseConfig) (*Database, error) {
 		return nil, fmt.Errorf("创建数据表失败: %v", err)
 	}
 
-	log.Println("数据库连接成功")
+	LogInfo("数据库连接成功")
 	return database, nil
 }
 
@@ -90,48 +92,63 @@ func (d *Database) createTables() error {
 		return fmt.Errorf("执行创建表SQL失败: %v", err)
 	}
 
-	log.Println("数据表创建/验证完成")
+	LogInfo("数据表创建/验证完成")
 	return nil
 }
 
 // FileExists 检查文件哈希是否已存在
-func (d *Database) FileExists(hash string) (bool, error) {
-	var count int
-	query := "SELECT COUNT(*) FROM file_records WHERE hash = $1"
-	
-	err := d.db.QueryRow(query, hash).Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("查询文件记录失败: %v", err)
-	}
+func (db *Database) FileExists(hash string) (bool, string, error) {
+	startTime := time.Now()
+	defer func() {
+		duration := time.Since(startTime)
+		LogInfo("⏱️ 数据库查询耗时 (FileExists): %v", duration)
+	}()
 
-	return count > 0, nil
+	var existingPath string
+	query := "SELECT target_path FROM file_records WHERE hash = $1 LIMIT 1"
+	err := db.db.QueryRow(query, hash).Scan(&existingPath)
+	
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, "", nil
+		}
+		return false, "", fmt.Errorf("查询文件记录失败: %v", err)
+	}
+	
+	return true, existingPath, nil
 }
 
 // InsertFileRecord 插入文件记录
-func (d *Database) InsertFileRecord(fileInfo *FileInfo) error {
-	query := `
-	INSERT INTO file_records (hash, original_name, file_size, extension, created_at, processed_at, source_path, target_path, hash_type)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	RETURNING id
-	`
+func (db *Database) InsertFileRecord(fileInfo FileInfo) error {
+	startTime := time.Now()
+	defer func() {
+		duration := time.Since(startTime)
+		LogInfo("⏱️ 数据库插入耗时 (InsertFileRecord): %v", duration)
+	}()
 
-	err := d.db.QueryRow(query,
+	query := `
+		INSERT INTO file_records (
+			hash, original_name, file_size, extension, created_at, 
+			processed_at, source_path, target_path, hash_type
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`
+	
+	_, err := db.db.Exec(query,
 		fileInfo.Hash,
-		fileInfo.OriginalName,
+		fileInfo.FileName,
 		fileInfo.FileSize,
 		fileInfo.Extension,
 		fileInfo.CreatedAt,
-		fileInfo.ProcessedAt,
-		fileInfo.SourcePath,
-		fileInfo.TargetPath,
-		fileInfo.HashType,
-	).Scan(&fileInfo.ID)
-
+		time.Now(),
+		fileInfo.OriginalPath,
+		fileInfo.NewPath,
+		"sha256",
+	)
+	
 	if err != nil {
 		return fmt.Errorf("插入文件记录失败: %v", err)
 	}
-
-	log.Printf("文件记录已插入: %s (%s)", fileInfo.OriginalName, fileInfo.Hash[:12]+"...")
+	
 	return nil
 }
 
@@ -252,7 +269,7 @@ func (d *Database) GetStatistics() (map[string]interface{}, error) {
 		var ext string
 		var count int
 		var size sql.NullInt64
-		
+
 		err := rows.Scan(&ext, &count, &size)
 		if err != nil {
 			return nil, fmt.Errorf("扫描扩展名统计失败: %v", err)
@@ -274,24 +291,22 @@ func (d *Database) GetStatistics() (map[string]interface{}, error) {
 }
 
 // DeleteFileRecord 删除文件记录
-func (d *Database) DeleteFileRecord(hash string) error {
+func (db *Database) DeleteFileRecord(hash string) error {
 	query := "DELETE FROM file_records WHERE hash = $1"
-	
-	result, err := d.db.Exec(query, hash)
+	result, err := db.db.Exec(query, hash)
 	if err != nil {
 		return fmt.Errorf("删除文件记录失败: %v", err)
 	}
-
+	
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("获取删除结果失败: %v", err)
 	}
-
-	if rowsAffected == 0 {
-		return fmt.Errorf("未找到要删除的文件记录: %s", hash)
+	
+	if rowsAffected > 0 {
+		LogInfo("文件记录已删除: %s", hash[:12]+"...")
 	}
-
-	log.Printf("文件记录已删除: %s", hash[:12]+"...")
+	
 	return nil
 }
 
