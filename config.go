@@ -1,3 +1,6 @@
+// 配置管理模块 - 负责系统配置的加载、验证和管理
+// 功能：YAML配置文件解析、配置项验证、默认值设置
+// 支持：数据库配置、文件处理配置、性能参数配置
 package main
 
 import (
@@ -9,62 +12,69 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DatabaseConfig 数据库配置
+// DatabaseConfig 数据库连接配置结构体
+// 包含PostgreSQL数据库的所有连接参数
 type DatabaseConfig struct {
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-	Database string `yaml:"database"`
-	SSLMode  string `yaml:"ssl_mode"`
+	Host     string `yaml:"host"`     // 数据库服务器地址
+	Port     int    `yaml:"port"`     // 数据库端口号
+	Username string `yaml:"username"` // 数据库用户名
+	Password string `yaml:"password"` // 数据库密码
+	Database string `yaml:"database"` // 数据库名称
+	SSLMode  string `yaml:"ssl_mode"` // SSL连接模式
 }
 
-// Config 应用程序配置
+// Config 应用程序主配置结构体
+// 包含系统运行所需的所有配置参数
 type Config struct {
-	Database         DatabaseConfig `yaml:"database"`
-	SourceFolder     string         `yaml:"source_folder"`
-	TargetFolder     string         `yaml:"target_folder"`
-	SupportedTypes   []string       `yaml:"supported_types"`
-	HashAlgorithm    string         `yaml:"hash_algorithm"`
-	LogLevel         string         `yaml:"log_level"`
-	MaxFileSize      int64          `yaml:"max_file_size"` // 最大文件大小(字节)
-	ConcurrentWorkers int           `yaml:"concurrent_workers"` // 并发处理数量
+	Database         DatabaseConfig `yaml:"database"`          // 数据库配置
+	SourceFolder     string         `yaml:"source_folder"`     // 源文件夹路径
+	TargetFolder     string         `yaml:"target_folder"`     // 目标文件夹路径
+	SupportedTypes   []string       `yaml:"supported_types"`   // 支持的文件类型列表
+	HashAlgorithm    string         `yaml:"hash_algorithm"`    // 哈希算法类型
+	LogLevel         string         `yaml:"log_level"`         // 日志级别
+	MaxFileSize      int64          `yaml:"max_file_size"`     // 最大文件大小(字节)
+	ConcurrentWorkers int           `yaml:"concurrent_workers"` // 并发处理协程数量
 }
 
-// LoadConfig 从文件加载配置
+// LoadConfig 从YAML文件加载系统配置
+// 参数：configPath - 配置文件路径
+// 返回：配置对象指针和错误信息
+// 功能：读取、解析、验证配置文件，返回可用的配置对象
 func LoadConfig(configPath string) (*Config, error) {
 	// 检查配置文件是否存在
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("配置文件不存在: %s", configPath)
 	}
 
-	// 读取配置文件
+	// 读取配置文件内容
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %v", err)
 	}
 
-	// 解析YAML
+	// 解析YAML格式配置
 	var config Config
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %v", err)
 	}
 
-	// 验证和处理配置
+	// 验证配置项的有效性
 	if err := config.validate(); err != nil {
 		return nil, fmt.Errorf("配置验证失败: %v", err)
 	}
 
-	// 处理路径
+	// 标准化文件路径格式
 	config.SourceFolder = filepath.Clean(config.SourceFolder)
 	config.TargetFolder = filepath.Clean(config.TargetFolder)
 
 	return &config, nil
 }
 
-// validate 验证配置的有效性
+// validate 验证配置参数的有效性
+// 检查必填项、数据范围、路径有效性等
+// 返回：验证错误信息，nil表示验证通过
 func (c *Config) validate() error {
-	// 验证数据库配置
+	// 验证数据库配置完整性
 	if c.Database.Host == "" {
 		return fmt.Errorf("数据库主机地址不能为空")
 	}

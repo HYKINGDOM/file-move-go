@@ -1,3 +1,6 @@
+// 日志管理模块 - 提供多级别、多输出的日志记录功能
+// 功能：支持DEBUG/INFO/WARN/ERROR级别，控制台和文件双输出
+// 特性：自动日志轮转、格式化输出、错误处理、panic恢复
 package main
 
 import (
@@ -11,17 +14,19 @@ import (
 	"time"
 )
 
-// LogLevel 日志级别
+// LogLevel 日志级别枚举
+// 定义系统支持的日志级别，从低到高：DEBUG < INFO < WARN < ERROR
 type LogLevel int
 
 const (
-	DEBUG LogLevel = iota
-	INFO
-	WARN
-	ERROR
+	DEBUG LogLevel = iota // 调试级别 - 详细的调试信息
+	INFO                  // 信息级别 - 一般的程序运行信息
+	WARN                  // 警告级别 - 潜在问题的警告信息
+	ERROR                 // 错误级别 - 错误和异常信息
 )
 
 // String 返回日志级别的字符串表示
+// 用于日志输出时显示可读的级别名称
 func (l LogLevel) String() string {
 	switch l {
 	case DEBUG:
@@ -38,17 +43,22 @@ func (l LogLevel) String() string {
 }
 
 // Logger 自定义日志记录器
+// 提供多级别日志记录，支持控制台和文件双输出
 type Logger struct {
-	level      LogLevel
-	logger     *log.Logger
-	file       *os.File
-	enableFile bool
+	level      LogLevel    // 当前日志级别，低于此级别的日志将被过滤
+	logger     *log.Logger // 底层日志记录器
+	file       *os.File    // 日志文件句柄
+	enableFile bool        // 是否启用文件输出
 }
 
 // NewLogger 创建新的日志记录器
+// 参数：level - 日志级别字符串，enableFileLog - 是否启用文件日志，logDir - 日志目录
+// 返回：日志记录器实例和错误信息
+// 功能：初始化日志记录器，配置输出目标，创建日志文件
 func NewLogger(level string, enableFileLog bool, logDir string) (*Logger, error) {
 	logLevel := parseLogLevel(level)
 	
+	// 配置日志输出目标
 	var writers []io.Writer
 	writers = append(writers, os.Stdout) // 总是输出到控制台
 
@@ -56,7 +66,7 @@ func NewLogger(level string, enableFileLog bool, logDir string) (*Logger, error)
 	if enableFileLog {
 		// 确保日志目录存在
 		if logDir == "" {
-			logDir = "logs"
+			logDir = "logs" // 默认日志目录
 		}
 		if err := os.MkdirAll(logDir, 0755); err != nil {
 			return nil, fmt.Errorf("创建日志目录失败: %v", err)

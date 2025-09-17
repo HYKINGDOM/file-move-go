@@ -1,3 +1,6 @@
+// 文件处理模块 - 高性能文件处理引擎，支持智能负载均衡和并发处理
+// 功能：文件哈希计算、重复检测、智能移动、批量处理
+// 特性：智能负载均衡、目录缓存、性能统计、错误处理、进度监控
 package main
 
 import (
@@ -6,7 +9,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -17,56 +19,71 @@ import (
 )
 
 // FileProcessor 文件处理器，支持智能负载均衡和优化的并发处理
+// 核心组件：负责文件的哈希计算、重复检测、智能移动等核心功能
 type FileProcessor struct {
-	config   *Config
-	database *Database
-	mutex    sync.RWMutex
-	stats    ProcessorStats
+	config   *Config   // 配置信息
+	database *Database // 数据库连接
+	mutex    sync.RWMutex // 读写互斥锁，保护共享资源
+	stats    ProcessorStats // 处理统计信息
 
-	// 智能负载均衡相关
-	workerLoad []int64      // 每个工作协程的负载计数
-	loadMutex  sync.RWMutex // 负载统计互斥锁
+	// 智能负载均衡相关字段
+	workerLoad []int64      // 每个工作协程的负载计数，用于负载均衡
+	loadMutex  sync.RWMutex // 负载统计互斥锁，保护负载数据
 
-	// 目录缓存相关
-	dirCache      map[string]bool // 目录存在性缓存
-	dirCacheMutex sync.RWMutex    // 目录缓存互斥锁
+	// 目录缓存相关字段，提高目录操作性能
+	dirCache       map[string]bool // 目录存在性缓存，避免重复检查
+	dirCacheMutex  sync.RWMutex    // 目录缓存互斥锁
 
-	// 队列管理
-	queueSize    int64 // 当前队列大小
-	maxQueueSize int64 // 最大队列大小
+	// 队列管理字段
+	queueSize    int64 // 当前队列大小，用于流量控制
+	maxQueueSize int64 // 最大队列大小，防止内存溢出
 
-	// 性能统计
-	totalProcessTime int64 // 总处理时间（纳秒）
-	processedCount   int64 // 已处理文件数
+	// 性能统计字段
+	totalProcessTime int64 // 总处理时间（纳秒），用于性能分析
+	processedCount   int64 // 已处理文件计数，原子操作保证线程安全
 }
 
-// ProcessorStats 处理器统计信息
+// ProcessorStats 处理器统计信息结构体
+// 用于记录和展示文件处理的各项统计数据
 type ProcessorStats struct {
-	ProcessedFiles int64
-	MovedFiles     int64
-	DeletedFiles   int64
-	ErrorCount     int64
-	TotalSize      int64
-	StartTime      time.Time
+	ProcessedFiles int64     // 已处理文件数量
+	MovedFiles     int64     // 已移动文件数量
+	DeletedFiles   int64     // 已删除重复文件数量
+	ErrorCount     int64     // 错误计数
+	TotalSize      int64     // 总处理文件大小（字节）
+	StartTime      time.Time // 处理开始时间
 }
 
 // NewFileProcessor 创建新的文件处理器，支持智能负载均衡
+// 参数：config - 配置信息，database - 数据库连接
+// 返回：文件处理器实例
+// 功能：初始化处理器，配置并发参数，设置负载均衡
 func NewFileProcessor(config *Config, database *Database) *FileProcessor {
-	// 根据系统资源动态调整并发数
+	// 根据系统资源动态调整并发数，优化性能
 	if config.ConcurrentWorkers <= 0 {
-		config.ConcurrentWorkers = runtime.NumCPU() * 2 // 默认为CPU核心数的2倍
+		config.ConcurrentWorkers = runtime.NumCPU() * 2 // 默认为CPU核心数的2倍，平衡CPU和I/O
+		LogInfo("🔧 自动设置并发工作协程数: %d (CPU核心数: %d)", config.ConcurrentWorkers, runtime.NumCPU())
 	}
+
+	// 初始化工作协程负载统计数组
+	workerLoad := make([]int64, config.ConcurrentWorkers)
+
+	// 初始化目录缓存
+	dirCache := make(map[string]bool)
+
+	// 设置队列大小
+	maxQueueSize := int64(config.ConcurrentWorkers * 50)
 
 	return &FileProcessor{
-		config:       config,
-		database:     database,
-		stats:        ProcessorStats{StartTime: time.Now()},
-		workerLoad:   make([]int64, config.ConcurrentWorkers),
-		dirCache:     make(map[string]bool),
-		maxQueueSize: int64(config.ConcurrentWorkers * 100), // 队列大小为工作协程数的100倍
+		config:        config,
+		database:      database,
+		stats:         ProcessorStats{StartTime: time.Now()},
+		workerLoad:    workerLoad,
+		dirCache:      dirCache,
+		maxQueueSize:  maxQueueSize,
+		queueSize:     0,
 	}
 }
-
 // ProcessExistingFiles 处理现有文件，使用优化的并发和队列管理
 func (fp *FileProcessor) ProcessExistingFiles() error {
 	LogInfo("开始扫描源文件夹: %s", fp.config.SourceFolder)
@@ -80,13 +97,6 @@ func (fp *FileProcessor) ProcessExistingFiles() error {
 	fileChan := make(chan string, channelSize)
 	errorChan := make(chan error, fp.config.ConcurrentWorkers)
 
-	// 启动智能工作协程
-	var wg sync.WaitGroup
-	LogInfo("启动 %d 个智能工作协程 (队列缓冲: %d)", fp.config.ConcurrentWorkers, channelSize)
-	for i := 0; i < fp.config.ConcurrentWorkers; i++ {
-		wg.Add(1)
-		go fp.smartWorker(i, fileChan, errorChan, &wg)
-	}
 
 	// 启动负载监控协程
 	loadMonitorDone := make(chan bool)
@@ -96,8 +106,13 @@ func (fp *FileProcessor) ProcessExistingFiles() error {
 	progressDone := make(chan bool)
 	go fp.showProgress(progressDone)
 
-	// 遍历文件夹
-	LogInfo("开始遍历文件夹: %s", fp.config.SourceFolder)
+	// 启动智能工作协程
+	var wg sync.WaitGroup
+	for i := 0; i < fp.config.ConcurrentWorkers; i++ {
+		wg.Add(1)
+		go fp.smartWorker(i, fileChan, errorChan, &wg)
+	}
+
 	totalFiles := 0
 	skippedFiles := 0
 	processedFiles := 0
@@ -106,7 +121,7 @@ func (fp *FileProcessor) ProcessExistingFiles() error {
 	err := filepath.Walk(fp.config.SourceFolder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			LogError("访问文件失败 %s: %v", path, err)
-			return nil // 继续处理其他文件
+			return nil
 		}
 
 		// 跳过目录
@@ -117,24 +132,15 @@ func (fp *FileProcessor) ProcessExistingFiles() error {
 		totalFiles++
 
 		// 检查文件类型
-		ext := strings.ToLower(filepath.Ext(path))
-		supported := false
-		for _, supportedType := range fp.config.SupportedTypes {
-			if ext == supportedType {
-				supported = true
-				break
-			}
-		}
-
-		if !supported {
+		if !fp.config.IsSupportedFile(path) {
 			skippedFiles++
 			return nil
 		}
 
 		// 检查文件大小
 		if info.Size() > int64(fp.config.MaxFileSize) {
-			LogWarn("文件超过大小限制，跳过: %s (大小: %d 字节)", path, info.Size())
 			skippedFiles++
+			LogDebug("文件过大，跳过: %s (大小: %d 字节)", path, info.Size())
 			return nil
 		}
 
@@ -152,7 +158,6 @@ func (fp *FileProcessor) ProcessExistingFiles() error {
 			}
 		}
 
-		// 发送到处理通道
 		select {
 		case fileChan <- path:
 			atomic.AddInt64(&fp.queueSize, 1)
@@ -183,19 +188,17 @@ func (fp *FileProcessor) ProcessExistingFiles() error {
 	}
 
 	// 等待所有工作协程完成
-	LogInfo("等待所有工作协程完成...")
 	wg.Wait()
 
-	// 停止监控协程
 	progressDone <- true
 	loadMonitorDone <- true
 
 	// 强制执行数据库批量操作
 	if err := fp.database.FlushPendingBatch(); err != nil {
-		LogError("强制执行批量数据库操作失败: %v", err)
+		LogError("刷新数据库批量操作失败: %v", err)
 	}
 
-	// 收集错误
+	// 处理错误
 	close(errorChan)
 	var errors []error
 	for err := range errorChan {
@@ -206,20 +209,18 @@ func (fp *FileProcessor) ProcessExistingFiles() error {
 		LogInfo("处理完成，开始打印统计信息...")
 		fp.printStats()
 	} else {
-		LogError("处理完成，但有 %d 个错误", len(errors))
-		fp.printStats()
+		LogError("处理过程中发生 %d 个错误", len(errors))
 		for _, err := range errors {
-			LogError("错误详情: %v", err)
+			LogError("错误: %v", err)
 		}
 	}
 
 	return nil
+
 }
 
-// smartWorker 智能工作协程，支持负载均衡
 func (fp *FileProcessor) smartWorker(workerID int, fileChan <-chan string, errorChan chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
-
 	LogInfo("智能工作协程 #%d 启动", workerID)
 	processedCount := 0
 
@@ -236,16 +237,17 @@ func (fp *FileProcessor) smartWorker(workerID int, fileChan <-chan string, error
 			default:
 				LogError("工作协程 #%d 处理文件失败 %s: %v", workerID, filePath, err)
 			}
-			fp.incrementErrorCount()
 		}
 
-		// 更新负载统计
 		processingTime := time.Since(startTime)
 		atomic.AddInt64(&fp.workerLoad[workerID], processingTime.Nanoseconds())
 		atomic.AddInt64(&fp.totalProcessTime, processingTime.Nanoseconds())
 		atomic.AddInt64(&fp.processedCount, 1)
 
 		processedCount++
+
+		// 更新统计信息
+		fp.incrementProcessedFiles()
 	}
 
 	LogInfo("智能工作协程 #%d 完成，处理文件数: %d", workerID, processedCount)
@@ -254,7 +256,6 @@ func (fp *FileProcessor) smartWorker(workerID int, fileChan <-chan string, error
 // monitorWorkerLoad 监控工作协程负载
 func (fp *FileProcessor) monitorWorkerLoad(done <-chan bool) {
 	ticker := time.NewTicker(30 * time.Second) // 每30秒监控一次
-	defer ticker.Stop()
 
 	for {
 		select {
@@ -337,6 +338,7 @@ func (fp *FileProcessor) ProcessFile(filePath string) error {
 	fileInfoStart := time.Now()
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
+		LogError("❌ 获取文件信息失败: %s - %v", filePath, err)
 		return fmt.Errorf("获取文件信息失败: %v", err)
 	}
 	LogDebug("⏱️ 获取文件信息耗时: %v", time.Since(fileInfoStart))
@@ -345,6 +347,7 @@ func (fp *FileProcessor) ProcessFile(filePath string) error {
 	hashStart := time.Now()
 	hash, err := fp.calculateFileHash(filePath)
 	if err != nil {
+		LogError("❌ 计算文件哈希失败: %s - %v", filePath, err)
 		return fmt.Errorf("计算文件哈希失败: %v", err)
 	}
 	hashDuration := time.Since(hashStart)
@@ -354,6 +357,7 @@ func (fp *FileProcessor) ProcessFile(filePath string) error {
 	dbCheckStart := time.Now()
 	exists, existingPath, err := fp.database.FileExists(hash)
 	if err != nil {
+		LogError("❌ 数据库查询失败: %s - %v", hash, err)
 		return fmt.Errorf("数据库查询失败: %v", err)
 	}
 	LogDebug("⏱️ 数据库查询耗时: %v", time.Since(dbCheckStart))
@@ -362,10 +366,11 @@ func (fp *FileProcessor) ProcessFile(filePath string) error {
 		// 文件已存在，删除重复文件
 		deleteStart := time.Now()
 		if err := os.Remove(filePath); err != nil {
+			LogError("❌ 删除重复文件失败: %s - %v", filePath, err)
 			return fmt.Errorf("删除重复文件失败: %v", err)
 		}
 		LogDebug("⏱️ 删除重复文件耗时: %v", time.Since(deleteStart))
-		LogInfo("删除重复文件: %s (已存在: %s)", filepath.Base(filePath), existingPath)
+		LogInfo("🗑️ 删除重复文件: %s (已存在: %s)", filepath.Base(filePath), existingPath)
 		fp.incrementDeletedFiles()
 		fp.addTotalSize(fileInfo.Size())
 		return nil
@@ -375,10 +380,11 @@ func (fp *FileProcessor) ProcessFile(filePath string) error {
 	moveStart := time.Now()
 	targetPath, err := fp.moveFileToTarget(filePath, filepath.Base(filePath))
 	if err != nil {
+		LogError("❌ 移动文件失败: %s - %v", filePath, err)
 		return fmt.Errorf("移动文件失败: %v", err)
 	}
 	moveDuration := time.Since(moveStart)
-	LogDebug("⏱️ 文件移动总耗时: %v -> %s", totalDuration, filepath.Base(sourcePath))
+	LogDebug("⏱️ 文件移动总耗时: %v -> %s", moveDuration, filepath.Base(targetPath))
 
 	// 插入数据库记录
 	dbInsertStart := time.Now()
@@ -394,18 +400,20 @@ func (fp *FileProcessor) ProcessFile(filePath string) error {
 
 	if err := fp.database.InsertFileRecord(fileRecord); err != nil {
 		// 如果数据库插入失败，尝试恢复文件
+		LogWarn("⚠️ 数据库插入失败，尝试恢复文件: %s", targetPath)
 		if moveErr := os.Rename(targetPath, filePath); moveErr != nil {
-			LogError("恢复文件失败: %v", moveErr)
+			LogError("❌ 恢复文件失败: %s -> %s - %v", targetPath, filePath, moveErr)
+		} else {
+			LogInfo("✅ 文件恢复成功: %s", filePath)
 		}
+		LogError("❌ 插入数据库记录失败: %v", err)
 		return fmt.Errorf("插入数据库记录失败: %v", err)
 	}
 	LogDebug("⏱️ 数据库插入耗时: %v", time.Since(dbInsertStart))
 
-	LogInfo("文件处理成功: %s -> %s", filepath.Base(filePath), filepath.Base(targetPath))
-	fp.incrementProcessedFiles()
+	LogInfo("✅ 文件处理成功: %s -> %s", filepath.Base(filePath), filepath.Base(targetPath))
 	fp.incrementMovedFiles()
 	fp.addTotalSize(fileInfo.Size())
-
 	return nil
 }
 
@@ -413,93 +421,89 @@ func (fp *FileProcessor) ProcessFile(filePath string) error {
 func (fp *FileProcessor) calculateFileHash(filePath string) (string, error) {
 	startTime := time.Now()
 	defer func() {
-		totalDuration := time.Since(startTime)
-		LogDebug("⏱️ 哈希计算总耗时: %v", totalDuration)
+		duration := time.Since(startTime)
+		LogDebug("⏱️ 哈希计算耗时: %v", duration)
 	}()
 
 	// 打开文件
-	openStart := time.Now()
 	file, err := os.Open(filePath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("打开文件失败: %v", err)
 	}
 	defer file.Close()
-	LogDebug("⏱️ 文件打开耗时: %v", time.Since(openStart))
 
-	// 获取文件信息
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return "", err
-	}
-	fileSize := fileInfo.Size()
-
-	// 创建哈希计算器
+	// 根据配置选择哈希算法
 	var hasher hash.Hash
-	switch fp.config.HashAlgorithm {
+	switch strings.ToLower(fp.config.HashAlgorithm) {
 	case "md5":
 		hasher = md5.New()
 	case "sha256":
 		hasher = sha256.New()
 	default:
-		hasher = sha256.New()
+		hasher = sha256.New() // 默认使用SHA256
+		LogWarn("⚠️ 未知的哈希算法 '%s'，使用默认的 SHA256", fp.config.HashAlgorithm)
 	}
 
-	// 使用1MB缓冲区进行文件读取和哈希计算
-	readStart := time.Now()
-	buffer := make([]byte, 1024*1024) // 1MB缓冲区
-	_, err = io.CopyBuffer(hasher, file, buffer)
-	if err != nil {
-		return "", err
+	// 使用缓冲区读取文件内容并计算哈希
+	buffer := make([]byte, 64*1024) // 64KB缓冲区
+	for {
+		n, err := file.Read(buffer)
+		if err != nil && err != io.EOF {
+			return "", fmt.Errorf("读取文件失败: %v", err)
+		}
+		if n == 0 {
+			break
+		}
+		hasher.Write(buffer[:n])
 	}
-	readDuration := time.Since(readStart)
 
-	// 计算读取速度
-	speed := float64(fileSize) / readDuration.Seconds() / (1024 * 1024) // MB/s
-
-	LogDebug("⏱️ 哈希计算详情: 总耗时=%v, 读取耗时=%v, 文件大小=%s, 读取速度=%.2f MB/s",
-		time.Since(startTime), readDuration, formatFileSize(fileSize), speed)
-
-	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+	// 返回十六进制哈希值
+	hashValue := fmt.Sprintf("%x", hasher.Sum(nil))
+	LogDebug("🔐 文件哈希计算完成: %s -> %s", filepath.Base(filePath), hashValue[:16]+"...")
+	return hashValue, nil
 }
 
-// moveFileToTarget 将文件移动到目标位置，优先使用原子移动操作
+// moveFileToTarget 移动文件到目标位置
 func (fp *FileProcessor) moveFileToTarget(sourcePath, fileName string) (string, error) {
-	startTime := time.Now()
-	defer func() {
-		totalDuration := time.Since(startTime)
-		LogDebug("⏱️ 文件移动总耗时: %v -> %s", totalDuration, filepath.Base(sourcePath))
-	}()
+	// 根据当前日期创建目标目录结构
+	now := time.Now()
+	targetDir := filepath.Join(fp.config.TargetFolder, 
+		fmt.Sprintf("%04d", now.Year()),
+		fmt.Sprintf("%02d", now.Month()),
+		fmt.Sprintf("%02d", now.Day()))
 
-	// 生成目标路径
-	pathGenStart := time.Now()
-	ext := strings.ToLower(filepath.Ext(fileName))
-	targetDir := filepath.Join(fp.config.TargetFolder, ext[1:]) // 去掉点号
-	targetPath := filepath.Join(targetDir, fileName)
-	LogDebug("⏱️ 路径生成耗时: %v", time.Since(pathGenStart))
-
-	// 使用缓存的目录创建
-	mkdirStart := time.Now()
+	// 确保目标目录存在
 	if err := fp.ensureDirectoryExists(targetDir); err != nil {
 		return "", fmt.Errorf("创建目标目录失败: %v", err)
 	}
-	LogDebug("⏱️ 目录创建耗时: %v", time.Since(mkdirStart))
+
+	// 构建目标文件路径
+	targetPath := filepath.Join(targetDir, fileName)
 
 	// 处理文件名冲突
 	counter := 1
-	conflictCheckStart := time.Now()
+	originalTargetPath := targetPath
 	for {
 		if _, err := os.Stat(targetPath); os.IsNotExist(err) {
-			break
+			break // 文件不存在，可以使用这个路径
 		}
+		
 		// 文件已存在，生成新的文件名
-		name := strings.TrimSuffix(fileName, filepath.Ext(fileName))
-		targetPath = filepath.Join(targetDir, fmt.Sprintf("%s_%d%s", name, counter, filepath.Ext(fileName)))
+		ext := filepath.Ext(fileName)
+		nameWithoutExt := strings.TrimSuffix(fileName, ext)
+		newFileName := fmt.Sprintf("%s_%d%s", nameWithoutExt, counter, ext)
+		targetPath = filepath.Join(targetDir, newFileName)
 		counter++
+		
+		// 防止无限循环
+		if counter > 1000 {
+			return "", fmt.Errorf("无法生成唯一文件名，已尝试 %d 次", counter)
+		}
 	}
-	if counter > 1 {
-		LogDebug("⏱️ 文件冲突检查耗时: %v (重命名次数: %d)", time.Since(conflictCheckStart), counter-1)
-	} else {
-		LogDebug("⏱️ 文件冲突检查耗时: %v", time.Since(conflictCheckStart))
+
+	// 记录文件名冲突处理
+	if targetPath != originalTargetPath {
+		LogInfo("📝 文件名冲突处理: %s -> %s", filepath.Base(originalTargetPath), filepath.Base(targetPath))
 	}
 
 	// 获取源文件信息用于性能统计

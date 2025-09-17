@@ -1,3 +1,6 @@
+// 数据库管理模块 - 负责PostgreSQL数据库的连接、操作和优化
+// 功能：文件记录的增删改查、批量操作、连接池管理、性能优化
+// 特性：支持批量插入、连接池优化、事务处理、统计查询
 package main
 
 import (
@@ -6,96 +9,121 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/lib/pq"
+	_ "github.com/lib/pq" // PostgreSQL驱动
 )
 
-// FileInfo 文件信息结构体
+// FileInfo 文件信息数据结构体
+// 用于存储文件的完整元数据信息，包括哈希值、路径、大小等
 type FileInfo struct {
-	ID           int64     `db:"id"`            // 自增主键
-	Hash         string    `db:"hash"`          // 文件哈希值(唯一索引)
+	ID           int64     `db:"id"`            // 数据库自增主键
+	Hash         string    `db:"hash"`          // 文件哈希值(用于重复检测，建立唯一索引)
 	OriginalName string    `db:"original_name"` // 原始文件名
-	OriginalPath string    `db:"original_path"` // 原始文件路径
-	NewPath      string    `db:"new_path"`      // 新文件路径
-	FileName     string    `db:"file_name"`     // 文件名
-	FileSize     int64     `db:"file_size"`     // 文件大小(字节)
-	Extension    string    `db:"extension"`     // 文件扩展名
+	OriginalPath string    `db:"original_path"` // 原始文件完整路径
+	NewPath      string    `db:"new_path"`      // 移动后的新文件路径
+	FileName     string    `db:"file_name"`     // 文件名（不含路径）
+	FileSize     int64     `db:"file_size"`     // 文件大小（字节）
+	Extension    string    `db:"extension"`     // 文件扩展名（小写）
 	CreatedAt    time.Time `db:"created_at"`    // 文件创建时间
-	ProcessedAt  time.Time `db:"processed_at"`  // 处理时间
+	ProcessedAt  time.Time `db:"processed_at"`  // 系统处理时间
 	SourcePath   string    `db:"source_path"`   // 源文件路径
 	TargetPath   string    `db:"target_path"`   // 目标文件路径
-	HashType     string    `db:"hash_type"`     // 哈希算法类型
+	HashType     string    `db:"hash_type"`     // 哈希算法类型（md5/sha256）
 }
 
-// Database 数据库连接包装器，支持批量操作和连接池优化
+// Database 数据库连接管理器
+// 提供高性能的数据库操作，支持批量处理和连接池优化
 type Database struct {
-	db          *sql.DB
-	batchBuffer []FileInfo    // 批量插入缓冲区
-	batchMutex  sync.Mutex    // 批量操作互斥锁
-	batchSize   int           // 批量大小
-	batchTimer  *time.Timer   // 批量定时器
+	db          *sql.DB       // 数据库连接对象
+	batchBuffer []FileInfo    // 批量插入缓冲区，提高插入性能
+	batchMutex  sync.Mutex    // 批量操作互斥锁，保证线程安全
+	batchSize   int           // 批量处理大小，默认1000条
+	batchTimer  *time.Timer   // 批量定时器，定期刷新缓冲区
 }
 
-// InitDatabase 初始化数据库连接，优化连接池配置
+// InitDatabase 初始化数据库连接和配置
+// 参数：config - 数据库配置信息
+// 返回：数据库管理器实例和错误信息
+// 功能：建立连接、配置连接池、创建表结构、启动批量处理定时器
 func InitDatabase(config DatabaseConfig) (*Database, error) {
+	LogInfo("🔗 正在初始化数据库连接...")
+	LogDebug("📋 数据库配置: host=%s, port=%d, database=%s, sslmode=%s", 
+		config.Host, config.Port, config.Database, config.SSLMode)
+	
+	// 构建PostgreSQL连接字符串
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		config.Host, config.Port, config.Username, config.Password, config.Database, config.SSLMode)
 
+	// 建立数据库连接
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
+		LogError("❌ 连接数据库失败: %v", err)
 		return nil, fmt.Errorf("连接数据库失败: %v", err)
 	}
 
-	// 测试连接
+	// 测试数据库连接可用性
+	LogDebug("🔍 正在测试数据库连接...")
 	if err := db.Ping(); err != nil {
 		db.Close()
+		LogError("❌ 数据库连接测试失败: %v", err)
 		return nil, fmt.Errorf("数据库连接测试失败: %v", err)
 	}
 
 	// 优化连接池参数 - 根据性能需求调整
+	LogDebug("⚙️ 配置数据库连接池参数...")
 	db.SetMaxOpenConns(50)        // 增加最大连接数以支持更高并发
 	db.SetMaxIdleConns(10)        // 增加空闲连接数
 	db.SetConnMaxLifetime(10 * time.Minute) // 延长连接生命周期
 	db.SetConnMaxIdleTime(5 * time.Minute)  // 设置空闲连接超时
 
+	// 创建数据库管理器实例
 	database := &Database{
 		db:          db,
-		batchBuffer: make([]FileInfo, 0, 100), // 初始化批量缓冲区
-		batchSize:   50,                       // 批量大小设为50
+		batchBuffer: make([]FileInfo, 0, 100), // 初始化批量缓冲区，预分配100个元素容量
+		batchSize:   50,                       // 批量大小设为50，平衡性能和内存使用
 	}
 
-	// 创建表
+	// 创建数据表和索引
+	LogDebug("📊 正在创建/验证数据表...")
 	if err := database.createTables(); err != nil {
 		db.Close()
+		LogError("❌ 创建数据表失败: %v", err)
 		return nil, fmt.Errorf("创建数据表失败: %v", err)
 	}
 
-	// 启动批量处理定时器
+	// 启动批量处理定时器，定期刷新缓冲区
+	LogDebug("⏰ 启动批量处理定时器...")
 	database.startBatchTimer()
 
-	LogInfo("数据库连接成功，连接池配置: MaxOpen=%d, MaxIdle=%d", 50, 10)
+	LogInfo("✅ 数据库连接成功，连接池配置: MaxOpen=%d, MaxIdle=%d", 50, 10)
 	return database, nil
 }
 
-// createTables 创建必要的数据表，优化索引配置
+// createTables 创建必要的数据表和索引
+// 功能：创建file_records表，建立性能优化索引
+// 特性：支持哈希唯一性约束、扩展名索引、时间索引
 func (d *Database) createTables() error {
+	LogDebug("🏗️ 开始创建数据表和索引...")
+	
+	// 创建文件记录表的SQL语句
+	// 包含完整的文件元数据字段和性能优化索引
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS file_records (
-		id SERIAL PRIMARY KEY,
-		hash VARCHAR(128) UNIQUE NOT NULL,
-		original_name VARCHAR(500) NOT NULL,
-		file_size BIGINT NOT NULL,
-		extension VARCHAR(50) NOT NULL,
-		created_at TIMESTAMP NOT NULL,
-		processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		source_path TEXT NOT NULL,
-		target_path TEXT,
-		hash_type VARCHAR(20) NOT NULL DEFAULT 'sha256'
+		id SERIAL PRIMARY KEY,                                    -- 自增主键
+		hash VARCHAR(128) UNIQUE NOT NULL,                        -- 文件哈希值，唯一约束
+		original_name VARCHAR(500) NOT NULL,                      -- 原始文件名
+		file_size BIGINT NOT NULL,                               -- 文件大小（字节）
+		extension VARCHAR(50) NOT NULL,                          -- 文件扩展名
+		created_at TIMESTAMP NOT NULL,                           -- 文件创建时间
+		processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,        -- 系统处理时间
+		source_path TEXT NOT NULL,                               -- 源文件路径
+		target_path TEXT,                                        -- 目标文件路径
+		hash_type VARCHAR(20) NOT NULL DEFAULT 'sha256'          -- 哈希算法类型
 	);
 
-	-- 创建优化的索引以提高查询性能
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_file_records_hash_unique ON file_records(hash);
-	CREATE INDEX IF NOT EXISTS idx_file_records_extension ON file_records(extension);
-	CREATE INDEX IF NOT EXISTS idx_file_records_processed_at ON file_records(processed_at DESC);
+	-- 创建性能优化索引，提高查询效率
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_file_records_hash_unique ON file_records(hash);           -- 哈希值唯一索引
+	CREATE INDEX IF NOT EXISTS idx_file_records_extension ON file_records(extension);               -- 扩展名索引
+	CREATE INDEX IF NOT EXISTS idx_file_records_processed_at ON file_records(processed_at DESC);    -- 处理时间倒序索引
 	CREATE INDEX IF NOT EXISTS idx_file_records_file_size ON file_records(file_size DESC);
 	CREATE INDEX IF NOT EXISTS idx_file_records_hash_type ON file_records(hash_type);
 	
@@ -110,30 +138,66 @@ func (d *Database) createTables() error {
 
 	_, err := d.db.Exec(createTableSQL)
 	if err != nil {
+		LogError("❌ 执行创建表SQL失败: %v", err)
 		return fmt.Errorf("执行创建表SQL失败: %v", err)
 	}
 
-	LogInfo("数据表创建/验证完成，索引优化完成")
+	LogInfo("✅ 数据表创建/验证完成，索引优化完成")
 	return nil
 }
 
-// FileExists 检查文件哈希是否已存在，使用预编译语句优化
-func (db *Database) FileExists(hash string) (bool, string, error) {
+// FileExistsWithDetails 检查文件哈希是否已存在，返回详细信息
+func (db *Database) FileExistsWithDetails(hash string) (bool, *FileInfo, error) {
 	startTime := time.Now()
 	defer func() {
 		duration := time.Since(startTime)
-		LogInfo("⏱️ 数据库查询耗时 (FileExists): %v", duration)
+		if duration > 100*time.Millisecond {
+			LogWarn("⚠️ 数据库查询耗时较长 (FileExistsWithDetails): %v", duration)
+		} else {
+			LogDebug("⏱️ 数据库查询耗时 (FileExistsWithDetails): %v", duration)
+		}
 	}()
 
-	var existingPath string
-	query := "SELECT target_path FROM file_records WHERE hash = $1 LIMIT 1"
-	err := db.db.QueryRow(query, hash).Scan(&existingPath)
+	var fileInfo FileInfo
+	query := `SELECT id, hash, original_name, original_path, new_path, file_name, 
+			  file_size, extension, created_at, processed_at, source_path, 
+			  target_path, hash_type FROM file_records WHERE hash = $1 LIMIT 1`
+	
+	err := db.db.QueryRow(query, hash).Scan(
+		&fileInfo.ID, &fileInfo.Hash, &fileInfo.OriginalName, &fileInfo.OriginalPath,
+		&fileInfo.NewPath, &fileInfo.FileName, &fileInfo.FileSize, &fileInfo.Extension,
+		&fileInfo.CreatedAt, &fileInfo.ProcessedAt, &fileInfo.SourcePath,
+		&fileInfo.TargetPath, &fileInfo.HashType,
+	)
 	
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return false, "", nil
+			LogDebug("🔍 文件哈希不存在: %s", hash[:12]+"...")
+			return false, nil, nil
 		}
-		return false, "", fmt.Errorf("查询文件记录失败: %v", err)
+		LogError("❌ 查询文件记录失败: %v", err)
+		return false, nil, fmt.Errorf("查询文件记录失败: %v", err)
+	}
+	
+	LogDebug("✅ 发现重复文件: %s -> %s", hash[:12]+"...", fileInfo.TargetPath)
+	return true, &fileInfo, nil
+}
+
+// FileExists 检查文件哈希是否已存在，优先返回target_path，如果为空则返回original_path
+func (db *Database) FileExists(hash string) (bool, string, error) {
+	exists, fileInfo, err := db.FileExistsWithDetails(hash)
+	if err != nil {
+		return false, "", err
+	}
+	
+	if !exists {
+		return false, "", nil
+	}
+	
+	// 优先返回target_path，如果为空则返回original_path
+	existingPath := fileInfo.TargetPath
+	if existingPath == "" {
+		existingPath = fileInfo.OriginalPath
 	}
 	
 	return true, existingPath, nil
@@ -144,17 +208,27 @@ func (db *Database) InsertFileRecord(fileInfo FileInfo) error {
 	return db.BatchInsertFileRecord(fileInfo)
 }
 
-// BatchInsertFileRecord 批量插入文件记录，提高性能
+// BatchInsertFileRecord 批量插入文件记录，提高插入性能
+// 参数：fileInfo - 文件信息记录
+// 返回：错误信息
+// 功能：将文件记录添加到批量缓冲区，达到批量大小时自动刷新
 func (db *Database) BatchInsertFileRecord(fileInfo FileInfo) error {
 	db.batchMutex.Lock()
 	defer db.batchMutex.Unlock()
 
 	// 添加到批量缓冲区
 	db.batchBuffer = append(db.batchBuffer, fileInfo)
+	LogDebug("📝 添加文件记录到批量缓冲区: %s (缓冲区大小: %d/%d)", 
+		fileInfo.FileName, len(db.batchBuffer), db.batchSize)
 
-	// 如果达到批量大小，立即执行批量插入
+	// 检查是否需要刷新批量缓冲区
 	if len(db.batchBuffer) >= db.batchSize {
-		return db.flushBatch()
+		LogDebug("🚀 批量缓冲区已满，开始刷新...")
+		if err := db.flushBatch(); err != nil {
+			LogError("❌ 批量刷新失败: %v", err)
+			return err
+		}
+		LogInfo("✅ 批量刷新完成，已处理 %d 条记录", db.batchSize)
 	}
 
 	// 重置定时器
@@ -172,9 +246,16 @@ func (db *Database) flushBatch() error {
 	}
 
 	startTime := time.Now()
+	batchCount := len(db.batchBuffer)
+	LogInfo("💾 开始批量插入数据库记录: %d 条", batchCount)
+	
 	defer func() {
 		duration := time.Since(startTime)
-		LogInfo("⏱️ 批量数据库插入耗时: %v (记录数: %d)", duration, len(db.batchBuffer))
+		if duration > 1*time.Second {
+			LogWarn("⚠️ 批量数据库插入耗时较长: %v (记录数: %d)", duration, batchCount)
+		} else {
+			LogInfo("✅ 批量数据库插入完成: %v (记录数: %d)", duration, batchCount)
+		}
 	}()
 
 	// 构建批量插入SQL
@@ -215,11 +296,13 @@ func (db *Database) flushBatch() error {
 
 	_, err := db.db.Exec(finalQuery, values...)
 	if err != nil {
+		LogError("❌ 批量插入文件记录失败: %v", err)
 		return fmt.Errorf("批量插入文件记录失败: %v", err)
 	}
 
 	// 清空缓冲区
 	db.batchBuffer = db.batchBuffer[:0]
+	LogDebug("🧹 批量缓冲区已清空")
 	
 	return nil
 }
@@ -231,8 +314,9 @@ func (db *Database) startBatchTimer() {
 		defer db.batchMutex.Unlock()
 		
 		if len(db.batchBuffer) > 0 {
+			LogDebug("⏰ 定时器触发批量插入: %d 条记录", len(db.batchBuffer))
 			if err := db.flushBatch(); err != nil {
-				LogError("定时批量插入失败: %v", err)
+				LogError("❌ 定时批量插入失败: %v", err)
 			}
 		}
 		
@@ -389,19 +473,24 @@ func (d *Database) GetStatistics() (map[string]interface{}, error) {
 
 // DeleteFileRecord 删除文件记录
 func (db *Database) DeleteFileRecord(hash string) error {
+	LogDebug("🗑️ 正在删除文件记录: %s", hash[:12]+"...")
 	query := "DELETE FROM file_records WHERE hash = $1"
 	result, err := db.db.Exec(query, hash)
 	if err != nil {
+		LogError("❌ 删除文件记录失败: %v", err)
 		return fmt.Errorf("删除文件记录失败: %v", err)
 	}
 	
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
+		LogError("❌ 获取删除结果失败: %v", err)
 		return fmt.Errorf("获取删除结果失败: %v", err)
 	}
 	
 	if rowsAffected > 0 {
-		LogInfo("文件记录已删除: %s", hash[:12]+"...")
+		LogInfo("✅ 文件记录已删除: %s", hash[:12]+"...")
+	} else {
+		LogWarn("⚠️ 未找到要删除的文件记录: %s", hash[:12]+"...")
 	}
 	
 	return nil

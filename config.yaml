@@ -3,16 +3,16 @@
 
 # 数据库配置
 database:
-  host: "192.168.5.8"          # 数据库主机地址
-  port: 5433                    # 数据库端口
-  username: "user_S5YD4z"       # 数据库用户名
-  password: "password_bFkZC5"   # 数据库密码
-  database: "user_S5YD4z"       # 数据库名
+  host: "10.0.203.172"          # 数据库主机地址
+  port: 5432                    # 数据库端口
+  username: "user_tZGjBb"       # 数据库用户名
+  password: "password_fajJed"   # 数据库密码
+  database: "user_tZGjBb"       # 数据库名
   ssl_mode: "disable"           # SSL模式: disable, require, verify-ca, verify-full
 
 # 文件夹配置
-source_folder: "J:\\新建文件夹"      # 源文件夹路径（监控的文件夹）
-target_folder: "V:\\iamge\\image"      # 目标文件夹路径（处理后文件存放位置）
+source_folder: "D:\\download"      # 源文件夹路径（监控的文件夹）
+target_folder: "D:\\converted_images"      # 目标文件夹路径（处理后文件存放位置）
 
 # 支持的文件类型（图片文件）
 supported_types:
@@ -40,12 +40,6 @@ log_level: "info"               # 日志级别: debug, info, warn, error
 # 性能配置
 max_file_size: 104857600        # 最大文件大小限制（字节），默认100MB
 concurrent_workers: 16          # 并发处理文件数量（优化：从4增加到16）
-
-# 高级配置（可选）
-# 以下配置项在代码中有默认值，可以根据需要调整
-
-# 监控配置
-# debounce_duration: 2          # 防抖延迟时间（秒）
 # retry_attempts: 3             # 文件处理重试次数
 # retry_delay: 1                # 重试间隔（秒）
 
